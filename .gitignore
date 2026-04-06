@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+
+# LlamaIndex / Vector Store
+storage/
+data/
+
+# Mac system files
+.DS_Store
