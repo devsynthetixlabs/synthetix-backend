@@ -9,4 +9,3 @@ python-dotenv
 thefuzz
 langchain_groq
 langchain_community
-llama-index-embeddings-huggingface
