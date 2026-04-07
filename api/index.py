@@ -97,11 +97,11 @@ def ask_synthetix_labs(question: str, history: List[Message]):
         # Ensure we return only the string 'answer' from the dict
         return result['answer'] if isinstance(result, dict) else result
         
-    # else:
-    #     # Document Search
-    #     print(f"📄 Routing to PDF Engine: {processed_question}")
-    #     from engine.pdf_engine import ask_policy
-    #     return ask_policy(processed_question)
+    else:
+        # Document Search
+        print(f"📄 Routing to PDF Engine: {processed_question}")
+        from engine.pdf_engine import ask_policy
+        return ask_policy(processed_question)
 
 @app.post("/ask")
 def handle_query(request: QueryRequest):

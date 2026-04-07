@@ -6,8 +6,8 @@ __pycache__/
 .env
 
 # LlamaIndex / Vector Store
-storage/
-data/
+# storage/
+# data/
 
 # Mac system files
 .DS_Store
