@@ -1,10 +1,7 @@
 fastapi
 uvicorn
 llama-index-core
-llama-index-readers-file
-llama-index-llms-gemini
 llama_index.llms.groq
-llama-index-embeddings-google-genai
 python-dotenv
 thefuzz
 langchain_groq
