@@ -11,3 +11,5 @@ __pycache__/
 
 # Mac system files
 .DS_Store
+.vercel
+.env*.local

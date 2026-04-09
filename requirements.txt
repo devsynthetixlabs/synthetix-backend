@@ -8,3 +8,5 @@ langchain_groq
 langchain_community
 google-genai
 pypdf
+psycopg2-binary
+openpyxl

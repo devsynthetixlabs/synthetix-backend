@@ -5,9 +5,12 @@ from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
 from llama_index.llms.groq import Groq
+from database.db import SessionLocal
+from sqlalchemy import text
 
 load_dotenv()
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 llm = Groq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"))
 
 app = FastAPI()
@@ -107,3 +110,26 @@ def ask_synthetix_labs(question: str, history: List[Message]):
 def handle_query(request: QueryRequest):
     answer = ask_synthetix_labs(request.question, request.history)
     return {"answer": answer}
+
+@app.get("/debug-db")
+def debug_db():
+    db = SessionLocal()
+    try:
+        # 1. Test the connection
+        result = db.execute(text("SELECT COUNT(*) FROM invoices")).fetchone()
+        
+        # 2. Fetch a sample
+        # We use .mappings() to ensure the result is returned as a dictionary-like object
+        sample = db.execute(text("SELECT invoice_number, company_name, invoice_amount FROM invoices LIMIT 1")).mappings().fetchone()
+        
+        return {
+            "status": "connected",
+            "database": "Vercel Postgres (Neon)",
+            "total_invoices": result[0] if result else 0,
+            "sample_data": dict(sample) if sample else "No data found"
+        }
+    except Exception as e:
+        # This will catch and show the exact error if it fails again
+        return {"status": "error", "message": str(e)}
+    finally:
+        db.close()

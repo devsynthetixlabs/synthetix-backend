@@ -1,12 +1,15 @@
 import os
 import locale
 import re
+import ast
 from dotenv import load_dotenv
 from thefuzz import process
 from langchain_groq import ChatGroq
 from langchain_community.utilities import SQLDatabase
 from langchain_classic.chains import create_sql_query_chain
 from langchain_core.prompts import ChatPromptTemplate
+from sqlalchemy import text
+from decimal import Decimal
 
 # Set the locale to Indian English
 try:
@@ -25,31 +28,27 @@ def format_inr(n):
 # TEST: format_inr(3305121) -> '₹33,05,121.00'
 
 def find_real_company_name(short_name):
-    # Search the DB for names containing the user's input
-    query = f"SELECT DISTINCT company_name FROM invoices WHERE company_name LIKE '%{short_name}%' LIMIT 1"
-    res = db.run(query)
-    # db.run usually returns a string representation of a list of tuples like "[('FULL NAME',)]"
-    if res and "[]" not in res:
-        # Extract the name from the string result
-        import ast
-        try:
-            actual_name = ast.literal_eval(res)[0][0]
-            return actual_name
-        except:
-            return short_name
+    query = text("SELECT DISTINCT company_name FROM invoices WHERE company_name ILIKE :name LIMIT 1")
+    try:
+        # Using the underlying engine for a clean result
+        with db._engine.connect() as connection:
+            result = connection.execute(query, {"name": f"%{short_name}%"}).fetchone()
+            if result:
+                return result[0] # Returns the string directly
+    except Exception as e:
+        print(f"Lookup error: {e}")
     return short_name
 
 # TEST: find_real_company_name("PRALCKA") -> "PRALCKA MACHINERY MANUFACTURING PVT. LTD"
 
 load_dotenv()
+
 # 1. Get the absolute path of the current file (sql_engine.py)
-current_dir = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# 2. Construct the path to the database in the sibling 'data' folder
-db_path = os.path.abspath(os.path.join(current_dir, "..", "data", "synthetix.db"))
-
-# 3. Connect using the absolute path
-db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
+db = SQLDatabase.from_uri(DATABASE_URL, engine_args={"connect_args": {"sslmode": "require"}})
 
 # 3. Initialize the Brain
 llm = ChatGroq(
@@ -272,55 +271,41 @@ def execute_query(query):
     return result
 
 def ask_cfo(question):
-    # Look for capitalized words that might be companies
-    words = re.findall(r'\b[A-Z]{2,}\b', question)
-    
-    refined_question = question
-    for word in words:
-        # Check if this word is a nickname for a real company
-        real_name = find_real_company_name(word)
-        if real_name != word:
-            refined_question = refined_question.replace(word, real_name)
     try:
         # 1. Generate SQL
         sql_writer_chain = sql_writer_prompt | llm
-        raw_sql = sql_writer_chain.invoke({"question": refined_question}).content
+        raw_sql = sql_writer_chain.invoke({"question": question}).content
         sql_query = clean_sql(raw_sql)
-        validate_sql(sql_query)
+
+        # 2. Execute SQL - Direct Engine call is safer than db.run()
+        with db._engine.connect() as connection:
+            db_data = connection.execute(text(sql_query)).fetchall()
         
-        # 2. Execute SQL
-        db_data = execute_query(sql_query)
         if not db_data:
             return "No data found for this period."
 
-        # 3. FIX: PRE-FORMAT THE DATA (The "Anti-Hallucination" Step)
-        # We process the list/result in Python to handle the currency formatting
+        # 3. THE "LOCK": Format numbers as strings in Python
+        # This ensures the LLM sees "₹8,58,30,762.86" as text, not a number it can change
         processed_data = []
-        if isinstance(db_data, list):
-            for row in db_data:
-                new_row = []
-                for item in row:
-                    # If it's a large number, format it as INR immediately
-                    if isinstance(item, (int, float)) and item > 100:
-                        new_row.append(format_inr(item))
-                    else:
-                        new_row.append(item)
-                processed_data.append(new_row)
-        else:
-            processed_data = db_data
+        for row in db_data:
+            new_row = []
+            for item in row:
+                if isinstance(item, (int, float, Decimal)):
+                    new_row.append(format_inr(item)) # Converts 85830762.86 -> "₹8,58,30,762.86"
+                else:
+                    new_row.append(str(item))
+            processed_data.append(new_row)
 
-        # 4. Narrate the already-formatted data
+        # 4. Narrate using YOUR specific prompt
         narrator_chain = narrator_prompt | llm
         answer = narrator_chain.invoke({
-            "result": processed_data, # Send the PRE-FORMATTED data
-            "question": refined_question
+            "result": str(processed_data), # Sending the already-formatted strings
+            "question": question
         })
 
         return {
-            "sql": sql_query,
-            "raw_result": db_data,
-            "processed_result": processed_data,
-            "answer": answer.content
+            "answer": answer.content,
+            "sql": sql_query
         }
 
     except Exception as e:
