@@ -11,19 +11,23 @@ from langchain_core.prompts import ChatPromptTemplate
 from sqlalchemy import text
 from decimal import Decimal
 
-# Set the locale to Indian English
-try:
-    locale.setlocale(locale.LC_ALL, 'en_IN')
-except:
-    # Fallback for systems where en_IN isn't installed
-    locale.setlocale(locale.LC_ALL, '') 
-
-def format_inr(n):
+def format_inr(number):
     try:
-        # 'n' is the float from your SQL result
-        return locale.currency(float(n), symbol=True, grouping=True)
-    except:
-        return f"₹{n}"
+        # Convert to float and round to 2 decimal places
+        n = f"{float(number):.2f}"
+        whole, fraction = n.split('.')
+        
+        # Indian Numbering Logic: Last 3 digits grouped, then groups of 2
+        if len(whole) > 3:
+            last_three = whole[-3:]
+            remaining = whole[:-3]
+            # Add commas every 2 digits for the remaining part
+            remaining = re.sub(r'(?<=.)(?=(..)+$)', ',', remaining)
+            whole = remaining + ',' + last_three
+        
+        return f"₹{whole}.{fraction}"
+    except Exception:
+        return f"₹{number}"
 
 # TEST: format_inr(3305121) -> '₹33,05,121.00'
 
