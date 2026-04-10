@@ -110,9 +110,6 @@ def ask_synthetix_labs(question: str, history: List[Message]):
 def handle_query(request: QueryRequest):
     answer = ask_synthetix_labs(request.question, request.history)
     return {"answer": answer}
-
-@app.get("/debug-db")
-def debug_db():
     db = SessionLocal()
     try:
         # 1. Test the connection
