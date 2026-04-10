@@ -65,7 +65,8 @@ llm = ChatGroq(
 chain = create_sql_query_chain(llm, db)
 
 sql_writer_prompt = ChatPromptTemplate.from_template("""
-    You are an expert SQLite analyst for a sales database.
+    You are an expert PostgreSQL analyst for a sales database.
+    (Note: You are using SQLAlchemy to interact with a Postgres database).
 
     SCHEMA:
 
@@ -84,95 +85,47 @@ sql_writer_prompt = ChatPromptTemplate.from_template("""
     items.invoice_number = invoices.invoice_number
     AND items.year = invoices.year
 
+    POSTGRES TYPE RULES:
+    - COLUMN 'year': This is a VARCHAR/TEXT column. 
+      * For filtering: Use single quotes: WHERE year = '2023'
+      * For math (YoY): You MUST cast it: CAST(year AS INTEGER) - 1
+    - ILIKE: Use ILIKE for case-insensitive text matching.
+    - DATE: Use standard ISO format 'YYYY-MM-DD'.
+
     CORE RULES:
-    - Generate ONLY one valid SELECT query
-    - Return ONLY SQL (no explanation, no semicolon)
-    - Use only columns from schema (no hallucination)
-    - Use simplest query possible (avoid unnecessary JOINs/subqueries)
-    - Treat each question independently (no previous context)
-    - MATCHING: Never use = for company_name. ALWAYS use LIKE '%name%'.
-    - CLEANING: If the user provides a short name (e.g., "A"), search for LIKE '%A%'.
+    - Generate ONLY one valid SELECT query.
+    - Return ONLY SQL (no explanation, no semicolon).
+    - Use only columns from the provided schema.
+    - MATCHING: Never use = for company_name. ALWAYS use ILIKE '%name%'.
 
     USAGE RULES:
-    - Use invoices for invoice/customer/revenue queries
-    - Use items for item/quantity/description queries
-    - Use JOIN only when both invoice + item data are needed:
-    items i JOIN invoices iv 
-    ON i.invoice_number = iv.invoice_number AND i.year = iv.year
-    - Use iv.company_name for customer (not items)
+    - Use 'invoices' for revenue, customer, or shipping queries.
+    - Use 'items' for quantity, product description, or rate queries.
+    - Use JOIN only when data from both tables is required.
 
-    AGGREGATION:
-    - Use SUM, COUNT, AVG, MAX when needed
-    - Use GROUP BY correctly when aggregating
-    - "customers" = COUNT(DISTINCT company_name)
+    AGGREGATION & MATH:
     - "revenue" = SUM(invoice_amount)
-    - "freight" = SUM(freight)
-
-    ORDERING & LIMIT:
-    - "highest", "top" → ORDER BY DESC
-    - "lowest", "bottom" → ORDER BY ASC
-    - Always use LIMIT for ranked queries
-    - Do NOT return unnecessary large datasets
-
-    MULTI-METRIC:
-    - If comparing metrics:
-    use MAX() for single invoice
-    use SUM() for total revenue
-    - Return all required values in same query
-
-    FINANCIAL YEAR (FY):
-    - FY = April 1 → March 31
-    - FY 2021-22 → date >= '2021-04-01' AND date <= '2022-03-31'
-    - Use date column for FY filtering (not just year)
-
-    CONSTRAINTS:
-    - Do NOT reuse values from previous queries
-    - Do NOT add filters not mentioned in question
-
-    FOR QUESTIONS asking:
-    - "largest", "highest", "top"
-
-    ALWAYS SELECT:
-    - both identifier (company_name)
-    - AND numeric value (invoice_amount or SUM)
-
-    Never return only name without value
+    - "customers" = COUNT(DISTINCT company_name)
+    - Handle Year-over-Year (YoY) by joining the table to itself or using subqueries with explicit CAST(year AS INTEGER).
 
     EXAMPLES:
 
     Q: Total revenue  
-    A:
-    SELECT SUM(invoice_amount) FROM invoices
-
-    Q: Top 5 customers  
-    A:
-    SELECT company_name, SUM(invoice_amount) AS total
-    FROM invoices
-    GROUP BY company_name
-    ORDER BY total DESC
-    LIMIT 5
-
-    Q: Most sold item  
-    A:
-    SELECT description, SUM(quantity) AS total_qty
-    FROM items
-    GROUP BY description
-    ORDER BY total_qty DESC
-    LIMIT 1
+    A: SELECT SUM(invoice_amount) FROM invoices
 
     Q: Largest order in 2021  
-    A:
-    SELECT company_name, invoice_amount
-    FROM invoices
-    WHERE year = '2021'
-    ORDER BY invoice_amount DESC
-    LIMIT 1
+    A: SELECT company_name, invoice_amount FROM invoices WHERE year = '2021' ORDER BY invoice_amount DESC LIMIT 1
 
-    Q: Total revenue in FY 2021-22  
-    A:
-    SELECT SUM(invoice_amount)
-    FROM invoices
-    WHERE date >= '2021-04-01' AND date <= '2022-03-31'
+    Q: Which company sales dropped year-on-year?
+    A: SELECT a.company_name, SUM(a.invoice_amount) as current, SUM(b.invoice_amount) as previous 
+       FROM invoices a 
+       JOIN invoices b ON a.company_name = b.company_name 
+       WHERE a.year = '2023' AND b.year = '2022' 
+       GROUP BY a.company_name 
+       HAVING SUM(a.invoice_amount) < SUM(b.invoice_amount)
+
+    Q: Sales for company X in FY 2021-22
+    A: SELECT SUM(invoice_amount) FROM invoices WHERE company_name ILIKE '%X%' AND date >= '2021-04-01' AND date <= '2022-03-31'
 
     User Question:
     {question}
