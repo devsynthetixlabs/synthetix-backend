@@ -10,6 +10,7 @@ from langchain_classic.chains import create_sql_query_chain
 from langchain_core.prompts import ChatPromptTemplate
 from sqlalchemy import text
 from decimal import Decimal
+from database.db_helper import get_db_schema
 
 def format_inr(number):
     try:
@@ -64,22 +65,17 @@ llm = ChatGroq(
 # 4. Create the Question-to-SQL Chain
 chain = create_sql_query_chain(llm, db)
 
+current_schema = get_db_schema(db._engine)
+
 sql_writer_prompt = ChatPromptTemplate.from_template("""
     You are an expert PostgreSQL analyst for a sales database.
     (Note: You are using SQLAlchemy to interact with a Postgres database).
 
-    SCHEMA:
+    DATABASE_SCHEMA:
+    {schema}
 
-    invoices(
-    invoice_number, date, company_name, gst_no,
-    invoice_amount, freight, packing_forwarding,
-    packing_charges, round_off, igst, cgst, sgst, year
-    )
-
-    items(
-    item_id, invoice_number, year,
-    description, quantity, rate, amount, discount
-    )
+    TENANT_CONTEXT:
+    Current Tenant ID: {tenant_id}
 
     RELATION:
     items.invoice_number = invoices.invoice_number
@@ -227,11 +223,15 @@ def execute_query(query):
 
     return result
 
-def ask_cfo(question):
+def ask_cfo(question, tenant_id):
     try:
         # 1. Generate SQL
         sql_writer_chain = sql_writer_prompt | llm
-        raw_sql = sql_writer_chain.invoke({"question": question}).content
+        raw_sql = sql_writer_chain.invoke({
+            "question": question, 
+            "schema": current_schema, # Dynamic injection
+            "tenant_id": tenant_id,
+        }).content
         sql_query = clean_sql(raw_sql)
 
         # 2. Execute SQL - Direct Engine call is safer than db.run()

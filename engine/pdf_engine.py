@@ -1,56 +1,42 @@
+import pdfplumber
 import os
-from google import genai
-from pypdf import PdfReader
-from dotenv import load_dotenv
 
-load_dotenv()
+def extract_structured_text(pdf_path):
+    structured_text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            structured_text += f"\n--- PAGE {i+1} ---\n"
+            
+            # Extract tables first
+            tables = page.extract_tables()
+            for table in tables:
+                structured_text += "\n### TABLE DATA ###\n"
+                for row in table:
+                    # Filter out None values and join with pipes for Markdown style
+                    structured_text += "| " + " | ".join([str(x) if x else "" for x in row]) + " |\n"
+            
+            # Extract plain text
+            text = page.extract_text()
+            if text:
+                structured_text += f"\n### TEXT CONTENT ###\n{text}\n"
+                
+    return structured_text
 
-# ✨ FIX 1: Initialize the client clearly
-# The 2026 SDK usually defaults to v1. We want to ensure we're on the right path.
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-
-def get_context_from_pdfs():
-    text_content = ""
-    if not os.path.exists(DATA_DIR):
-        return "No documents found."
-
-    for file in os.listdir(DATA_DIR):
-        if file.endswith(".pdf"):
-            path = os.path.join(DATA_DIR, file)
-            try:
-                reader = PdfReader(path)
-                for page in reader.pages:
-                    text_content += page.extract_text() + "\n"
-            except Exception as e:
-                print(f"Error reading {file}: {e}")
+def get_relevant_pdf_context(question, tenant_id):
+    # 1. Extract keywords from the question (e.g., "Discount Policy")
+    # 2. Query the 'document_knowledge' table
+    query = text("""
+        SELECT content FROM document_knowledge 
+        WHERE tenant_id = :tid 
+        AND content ILIKE :search
+        LIMIT 2
+    """)
     
-    return text_content
-
-def ask_policy(question):
-    context = get_context_from_pdfs()
-    
-    prompt = f"Using the context: {context}, answer: {question}"
-
-    try:
-        # 🚀 UPDATE: Using the 2.5 series model which supports 1M+ context
-        # Standard format in 2026 is just the ID string
-        response = client.models.generate_content(
-            model="gemini-2.5-flash", 
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        # Fallback to 2.0 if 2.5 is not yet in your region
-        if "404" in str(e):
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash", 
-                    contents=prompt
-                )
-                return response.text.strip()
-            except Exception as inner_e:
-                return f"AI Error: {str(inner_e)}"
-        return f"AI Error: {str(e)}"
+    with db._engine.connect() as conn:
+        results = conn.execute(query, {
+            "tid": tenant_id, 
+            "search": f"%{question[:20]}%" # Simplistic keyword search
+        }).fetchall()
+        
+    return "\n".join([r[0] for r in results])

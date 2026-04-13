@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from llama_index.llms.groq import Groq
 from database.db import SessionLocal
 from sqlalchemy import text
+from fastapi import UploadFile, File
+from engine.pdf_engine import extract_structured_text
 
 load_dotenv()
 
@@ -39,6 +41,7 @@ class Message(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     history: List[Message]
+    tenant_id: str
 
 # --- Classification Logic ---
 def classify_query(question: str):
@@ -70,7 +73,7 @@ def is_followup(question: str):
     return any(word in question.lower() for word in followup_words)
 
 # --- Logic Layer ---
-def ask_synthetix_labs(question: str, history: List[Message]):
+def ask_synthetix_labs(question: str, history: List[Message], tenant_id: str):
     processed_question = question
     
     # 1. THE REFINER (Context Injection)
@@ -90,46 +93,40 @@ def ask_synthetix_labs(question: str, history: List[Message]):
         print(f"🤖 Routing to CrewAI Strategy: {processed_question}")
         # Assuming you wrapped your Crew logic in a function called run_sales_strategy
         from engine.strategy_engine import ask_strategy
-        return ask_strategy(processed_question)
+        return ask_strategy(processed_question, tenant_id)
 
     elif route == "SQL":
         # Single-Agent / Direct Tool Access
         print(f"📊 Routing to SQL Engine: {processed_question}")
         from engine.sql_engine import ask_cfo
-        result = ask_cfo(processed_question)
+        result = ask_cfo(processed_question, tenant_id)
         # Ensure we return only the string 'answer' from the dict
         return result['answer'] if isinstance(result, dict) else result
         
     else:
         # Document Search
         print(f"📄 Routing to PDF Engine: {processed_question}")
-        from engine.pdf_engine import ask_policy
-        return ask_policy(processed_question)
+        from engine.pdf_engine import get_relevant_pdf_context
+        return get_relevant_pdf_context(processed_question, tenant_id)
 
 @app.post("/ask")
 def handle_query(request: QueryRequest):
-    answer = ask_synthetix_labs(request.question, request.history)
+    answer = ask_synthetix_labs(request.question, request.history, request.tenant_id)
     return {"answer": answer}
 
-@app.get("/debug-db")
-def debug_db():
-    db = SessionLocal()
-    try:
-        # 1. Test the connection
-        result = db.execute(text("SELECT COUNT(*) FROM invoices")).fetchone()
-        
-        # 2. Fetch a sample
-        # We use .mappings() to ensure the result is returned as a dictionary-like object
-        sample = db.execute(text("SELECT invoice_number, company_name, invoice_amount FROM invoices LIMIT 1")).mappings().fetchone()
-        
-        return {
-            "status": "connected",
-            "database": "Vercel Postgres (Neon)",
-            "total_invoices": result[0] if result else 0,
-            "sample_data": dict(sample) if sample else "No data found"
-        }
-    except Exception as e:
-        # This will catch and show the exact error if it fails again
-        return {"status": "error", "message": str(e)}
-    finally:
-        db.close()
+
+
+@app.post("/upload-knowledge")
+async def upload_doc(tenant_id: str, file: UploadFile = File(...)):
+    # 1. Save file temporarily
+    file_path = f"temp_{file.filename}"
+    with open(file_path, "wb") as buffer:
+        buffer.write(await file.read())
+    
+    # 2. Parse intelligently
+    full_text = extract_structured_text(file_path)
+    
+    # 4. Cleanup
+    os.remove(file_path)
+    
+    return {"status": "success", "message": f"Learned from {file.filename}"}
