@@ -100,6 +100,26 @@ async def login(credentials: UserLogin):
         }
     }
 
+@router.post("/refresh")
+async def refresh_access_token(refresh_token: str):
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        # Security Check: Ensure it's actually a refresh token
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+            
+        tenant_id = payload.get("tenant_id")
+        email = payload.get("sub")
+        
+        # Issue a new short-lived access token
+        new_access_token = create_access_token(data={"sub": email, "tenant_id": tenant_id})
+        
+        return {"access_token": new_access_token, "token_type": "bearer"}
+        
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired. Please login again.")
+
 def get_current_user(user: str = Depends(auth_guard)):
     """
     1. Extracts the token from the Authorization header.

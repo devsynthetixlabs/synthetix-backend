@@ -37,3 +37,9 @@ def decode_token(token: str):
         return payload # This will contain our tenant_id and email
     except JWTError:
         return None
+
+def create_refresh_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=7) # Long lived
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
