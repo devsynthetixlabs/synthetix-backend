@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -7,13 +7,12 @@ from dotenv import load_dotenv
 from llama_index.llms.groq import Groq
 from database.db import SessionLocal
 from sqlalchemy import text
-from fastapi import UploadFile, File
 from engine.pdf_engine import extract_structured_text
-
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-llm = Groq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"))
+from api.auth import router as auth_router
+from api.auth import get_current_user # Import your dependency
+from langchain_community.utilities import SQLDatabase
+from engine.pdf_engine import get_relevant_pdf_context_with_rerank
+from engine.core import db, llm
 
 app = FastAPI()
 
@@ -22,6 +21,7 @@ origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://synthetix-web-app.vercel.app",
+    "http://192.168.31.231:8000",
 ]
 
 app.add_middleware(
@@ -41,7 +41,7 @@ class Message(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     history: List[Message]
-    tenant_id: str
+    # tenant_id: str
 
 # --- Classification Logic ---
 def classify_query(question: str):
@@ -66,7 +66,7 @@ def classify_query(question: str):
     """
 
     response = llm.complete(prompt)
-    return response.text.strip().upper()
+    return str(response.text).strip().upper()
 
 def is_followup(question: str):
     followup_words = ["it", "this", "that", "they", "those", "them"]
@@ -81,7 +81,7 @@ def ask_synthetix_labs(question: str, history: List[Message], tenant_id: str):
         recent_context = "\n".join([f"{msg.sender}: {msg.text}" for msg in history[-3:]])
         refine_prompt = f"Chat History:\n{recent_context}\nUser Question:\n{question}\nRewrite as a standalone question:"
         response = llm.complete(refine_prompt)
-        processed_question = response.text.strip()
+        processed_question = str(response.text).strip()
 
     # 2. THE DISPATCHER (Routing)
     route = classify_query(processed_question)
@@ -106,27 +106,100 @@ def ask_synthetix_labs(question: str, history: List[Message], tenant_id: str):
     else:
         # Document Search
         print(f"📄 Routing to PDF Engine: {processed_question}")
-        from engine.pdf_engine import get_relevant_pdf_context
-        return get_relevant_pdf_context(processed_question, tenant_id)
+        return ask_synthetix_labs_self_rag(processed_question, tenant_id)
+
+def ask_synthetix_labs_self_rag(question, tenant_id):
+    # 1. RETRIEVE
+    context = get_relevant_pdf_context_with_rerank(question, tenant_id)
+    
+    # 2. REFLECT: Is the context relevant?
+    relevance_prompt = f"Given this question: '{question}', is the following text relevant? Answer only 'YES' or 'NO'. \nText: {context}"
+    is_relevant = llm.complete(relevance_prompt).text # Fast, cheap model call
+
+    if "NO" in is_relevant.upper():
+        # Fallback: Maybe search the database again with different keywords 
+        # or tell the user the documents aren't helpful.
+        return "I found some documents, but they don't seem to address your specific question."
+
+    # 3. GENERATE
+    generation_prompt = f"""
+    You are a concise office assistant. Use ONLY the provided context to answer the question.
+    If the information is not in the context, say you don't know. 
+    Do not provide general historical or cultural background unless specifically asked.
+
+    CONTEXT:
+    {context}
+
+    QUESTION: 
+    {question}
+
+    ANSWER:
+    """
+    draft_answer = llm.complete(generation_prompt).text
+
+    # 4. REFLECT: Does the answer hallucinate?
+    hallucination_check = f"Does the answer '{draft_answer}' contain info NOT present in the context: '{context}'? Answer 'SAFE' or 'HALLUCINATION'."
+    check_result = llm.complete(hallucination_check).text
+
+    if "HALLUCINATION" in check_result.upper():
+        return "I'm sorry, I can't find a factual basis for that answer in your uploaded documents."
+
+    return draft_answer
 
 @app.post("/ask")
-def handle_query(request: QueryRequest):
-    answer = ask_synthetix_labs(request.question, request.history, request.tenant_id)
+def handle_query(request: QueryRequest, user: dict = Depends(get_current_user)):
+    # 1. Extract context from the verified token, NOT the request body
+    # This prevents 'Tenant Spoofing' (User A asking for User B's data)
+    tenant_id = user.get("tenant_id")
+    
+    # 2. Pass the verified tenant_id into your AI engine
+    answer = ask_synthetix_labs(
+        request.question, 
+        request.history, 
+        tenant_id
+    )
+    
     return {"answer": answer}
 
-
-
 @app.post("/upload-knowledge")
-async def upload_doc(tenant_id: str, file: UploadFile = File(...)):
-    # 1. Save file temporarily
+async def upload_doc(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    # 1. Securely get the tenant_id from the token, not the request body
+    tenant_id = user.get("tenant_id")
+    
+    # 2. Save file temporarily
     file_path = f"temp_{file.filename}"
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+        
+        # 3. Parse intelligently
+        full_text = extract_structured_text(file_path)
+
+        # 4. Save to Neon Database
+        query = text("""
+            INSERT INTO document_knowledge (tenant_id, file_name, content)
+            VALUES (:tid, :fname, :cont)
+        """)
+        
+        with db._engine.connect() as conn:
+            conn.execute(query, {
+                "tid": tenant_id,
+                "fname": file.filename,
+                "cont": full_text
+            })
+            conn.commit() # Important for non-autocommit engines
+
+        return {
+            "status": "success", 
+            "message": f"Successfully learned from {file.filename} for tenant {tenant_id}"
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
     
-    # 2. Parse intelligently
-    full_text = extract_structured_text(file_path)
-    
-    # 4. Cleanup
-    os.remove(file_path)
-    
-    return {"status": "success", "message": f"Learned from {file.filename}"}
+    finally:
+        # 5. Cleanup temp file regardless of success or failure
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+app.include_router(auth_router)

@@ -3,12 +3,7 @@ from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
 from engine.sql_engine import ask_cfo  # Import your perfected engine
-
-load_dotenv()
-
-# 1. THE BRAIN
-# Using Llama 3.1 8b for speed and to minimize rate limits
-my_llm = LLM(model="groq/llama-3.1-8b-instant", temperature=0.1)
+from engine.core import llm
 
 # 2. THE TOOL
 # We wrap your sql_engine in a CrewAI tool decorator
@@ -29,7 +24,7 @@ analyst = Agent(
     You must always include the tenant_id provided in your instructions 
     when calling the tool to ensure data privacy.""",
     tools=[sales_data_tool],
-    llm=my_llm,
+    llm=llm,
     verbose=True,
     allow_delegation=False,
     max_iter=5,              # 🚨 Stops infinite loops
@@ -41,7 +36,7 @@ strategist = Agent(
     role='Senior Business Consultant',
     goal='Develop marketing plans...',
     backstory="...",
-    llm=my_llm,
+    llm=llm,
     verbose=True,
     max_execution_time=120    # 🚨 Increase timeout
 )

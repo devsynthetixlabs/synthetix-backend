@@ -11,6 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from sqlalchemy import text
 from decimal import Decimal
 from database.db_helper import get_db_schema
+from engine.core import db
 
 def format_inr(number):
     try:
@@ -47,13 +48,6 @@ def find_real_company_name(short_name):
 # TEST: find_real_company_name("PRALCKA") -> "PRALCKA MACHINERY MANUFACTURING PVT. LTD"
 
 load_dotenv()
-
-# 1. Get the absolute path of the current file (sql_engine.py)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-db = SQLDatabase.from_uri(DATABASE_URL, engine_args={"connect_args": {"sslmode": "require"}})
 
 # 3. Initialize the Brain
 llm = ChatGroq(
@@ -224,46 +218,68 @@ def execute_query(query):
     return result
 
 def ask_cfo(question, tenant_id):
-    try:
-        # 1. Generate SQL
-        sql_writer_chain = sql_writer_prompt | llm
-        raw_sql = sql_writer_chain.invoke({
-            "question": question, 
-            "schema": current_schema, # Dynamic injection
-            "tenant_id": tenant_id,
-        }).content
-        sql_query = clean_sql(raw_sql)
+    max_retries = 3
+    error_log = ""
+    last_sql = ""
+    
+    for attempt in range(max_retries):
+        try:
+            # Step 1: Generate SQL (feeding back errors if they exist)
+            sql_writer_chain = sql_writer_prompt | llm
+            raw_sql = sql_writer_chain.invoke({
+                "question": f"{question} {error_log}", 
+                "schema": current_schema,
+                "tenant_id": tenant_id,
+            }).content
+            
+            sql_query = clean_sql(raw_sql)
+            last_sql = sql_query # Store for debugging
+            validate_sql(sql_query)
 
-        # 2. Execute SQL - Direct Engine call is safer than db.run()
-        with db._engine.connect() as connection:
-            db_data = connection.execute(text(sql_query)).fetchall()
-        
-        if not db_data:
-            return "No data found for this period."
+            # Step 2: Execute against Neon
+            with db._engine.connect() as connection:
+                db_data = connection.execute(text(sql_query)).fetchall()
+            
+            # Step 3: SUCCESS - Process and return
+            formatted_answer = process_and_narrate(db_data, question)
+            return {
+                "answer": formatted_answer,
+                "sql": last_sql
+            }
 
-        # 3. THE "LOCK": Format numbers as strings in Python
-        # This ensures the LLM sees "₹8,58,30,762.86" as text, not a number it can change
-        processed_data = []
-        for row in db_data:
-            new_row = []
-            for item in row:
-                if isinstance(item, (int, float, Decimal)):
-                    new_row.append(format_inr(item)) # Converts 85830762.86 -> "₹8,58,30,762.86"
-                else:
-                    new_row.append(str(item))
-            processed_data.append(new_row)
+        except Exception as e:
+            # Step 4: FAILURE - Log error and loop back
+            error_log = f"\n(Previous Attempt Error: {str(e)})"
+            print(f"🔄 Retrying SQL (Attempt {attempt + 1}/3)...")
+            
+    return {
+        "answer": "I attempted to query the data but ran into a structural issue I couldn't resolve.",
+        "sql": last_sql
+    }
 
-        # 4. Narrate using YOUR specific prompt
-        narrator_chain = narrator_prompt | llm
-        answer = narrator_chain.invoke({
-            "result": str(processed_data), # Sending the already-formatted strings
-            "question": question
-        })
+def process_and_narrate(db_data, question):
+    """
+    Processes raw SQL rows into formatted strings and calls the LLM Narrator.
+    """
+    if not db_data:
+        return "No data found for this period."
 
-        return {
-            "answer": answer.content,
-            "sql": sql_query
-        }
+    # 1. Format numbers using your format_inr logic
+    processed_data = []
+    for row in db_data:
+        new_row = []
+        for item in row:
+            if isinstance(item, (int, float, Decimal)):
+                new_row.append(format_inr(item)) # Uses your existing ₹ logic
+            else:
+                new_row.append(str(item))
+        processed_data.append(new_row)
 
-    except Exception as e:
-        return f"Error: {str(e)}"
+    # 2. Call the Narrator Chain
+    narrator_chain = narrator_prompt | llm
+    answer = narrator_chain.invoke({
+        "result": str(processed_data),
+        "question": question
+    })
+
+    return answer.content
