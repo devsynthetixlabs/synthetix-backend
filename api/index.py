@@ -11,8 +11,8 @@ from engine.pdf_engine import extract_structured_text
 from api.auth import router as auth_router
 from api.auth import get_current_user # Import your dependency
 from langchain_community.utilities import SQLDatabase
-from engine.pdf_engine import get_relevant_pdf_context_with_rerank
-from engine.core import db, llm
+from engine.pdf_engine import get_hybrid_pdf_context
+from engine.core import db, llm, get_embedding
 
 app = FastAPI()
 
@@ -20,8 +20,9 @@ app = FastAPI()
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://synthetix-web-app.vercel.app",
     "http://192.168.31.231:8000",
+    "https://synthetix-web-app.vercel.app",
+    "https://synthetix-backend.vercel.app",
 ]
 
 app.add_middleware(
@@ -110,41 +111,92 @@ def ask_synthetix_labs(question: str, history: List[Message], tenant_id: str):
 
 def ask_synthetix_labs_self_rag(question, tenant_id):
     # 1. RETRIEVE
-    context = get_relevant_pdf_context_with_rerank(question, tenant_id)
+    raw_context_data = get_hybrid_pdf_context(question, tenant_id)
     
-    # 2. REFLECT: Is the context relevant?
-    relevance_prompt = f"Given this question: '{question}', is the following text relevant? Answer only 'YES' or 'NO'. \nText: {context}"
-    is_relevant = llm.complete(relevance_prompt).text # Fast, cheap model call
+    if not raw_context_data:
+        return "I couldn't find any documents in your knowledge base."
 
-    if "NO" in is_relevant.upper():
-        # Fallback: Maybe search the database again with different keywords 
-        # or tell the user the documents aren't helpful.
-        return "I found some documents, but they don't seem to address your specific question."
+    # 2. FORMAT (Ensuring metadata is clear for the LLM)
+    formatted_context = ""
+    for idx, doc in enumerate(raw_context_data):
+        formatted_context += (
+            f"\n### DOCUMENT {idx+1} ###\n"
+            f"FILE: {doc.get('file_name')}\n"
+            f"DATE: {doc.get('created_at')}\n"
+            f"CONTENT: {doc.get('content')}\n"
+        )
 
-    # 3. GENERATE
-    generation_prompt = f"""
-    You are a concise office assistant. Use ONLY the provided context to answer the question.
-    If the information is not in the context, say you don't know. 
-    Do not provide general historical or cultural background unless specifically asked.
-
+    # 3. RELEVANCE CHECK (The 'Gatekeeper')
+    relevance_prompt = f"""
+    Evaluate if this context helps answer: "{question}"
+    Look for keywords, dates, or lists in the 'CONTENT' sections.
+    Answer only YES or NO.
+    
     CONTEXT:
-    {context}
+    {formatted_context}
+    """
+    
+    # Use .strip() and .upper() to avoid "I couldn't process" errors on malformed strings
+    is_relevant = llm.complete(relevance_prompt).text.strip().upper()
 
-    QUESTION: 
-    {question}
+    # FAIL-SAFE: If the model is being too picky, we force a YES if the list isn't empty
+    if "NO" in is_relevant and len(raw_context_data) > 0:
+        # Log this so you know the filter was too strict
+        print(f"⚠️ Relevance filter was too strict for query: {question}")
+        is_relevant = "YES"
+
+    if "YES" not in is_relevant:
+        return "The documents I found don't seem to contain a specific answer for you."
+
+    # 4. GENERATE (With Citation & Conflict Logic)
+    generation_prompt = f"""
+    You are the Synthetix Labs Corporate Assistant. Provide a professional and concise response based on the provided context.
+
+    USER QUESTION: "{question}"
+    CONTEXT: {formatted_context}
+
+    STYLE GUIDELINES:
+    1. Start with a clear "Yes" or "No" in bold.
+    2. Use professional terminology (e.g., "designated as," "constitutes," "official holiday").
+    3. Ensure the logical connection between the date and the day of the week is explained smoothly, not as a list of math steps.
+    4. Always cite the specific source file in bold.
+
+    STRUCTURE:
+    - **Bold Answer Line**
+    - A brief paragraph explaining the reasoning and date verification.
+    - A final "Status" line if applicable.
 
     ANSWER:
     """
-    draft_answer = llm.complete(generation_prompt).text
+    
+    draft_answer= llm.complete(generation_prompt).text
 
     # 4. REFLECT: Does the answer hallucinate?
-    hallucination_check = f"Does the answer '{draft_answer}' contain info NOT present in the context: '{context}'? Answer 'SAFE' or 'HALLUCINATION'."
-    check_result = llm.complete(hallucination_check).text
+    hallucination_check = f"""
+    Compare the Answer to the Context below.
+    Question: {question}
+    Context: {raw_context_data}
+    Answer: {draft_answer}
+
+    Is the Answer supported by the Context? 
+    - Answer 'SAFE' if the dates, names, and facts in the Answer are present in the Context.
+    - Answer 'HALLUCINATION' only if the Answer makes up information NOT found in the Context.
+    - Minor rephrasing is fine.
+
+    Answer ONLY 'SAFE' or 'HALLUCINATION':
+    """
+    check_result = llm.complete(hallucination_check).text.strip()
 
     if "HALLUCINATION" in check_result.upper():
+        # Optimization: If the answer is about a holiday and matches a date in the context,
+        # it's likely safe. We can refine this check later.
         return "I'm sorry, I can't find a factual basis for that answer in your uploaded documents."
 
-    return draft_answer
+    return {
+    "answer": draft_answer,
+    "sources": [doc.get('file_name') for doc in raw_context_data],
+    "status": "success"
+    }
 
 @app.post("/ask")
 def handle_query(request: QueryRequest, user: dict = Depends(get_current_user)):
@@ -163,42 +215,46 @@ def handle_query(request: QueryRequest, user: dict = Depends(get_current_user)):
 
 @app.post("/upload-knowledge")
 async def upload_doc(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    # 1. Securely get the tenant_id from the token, not the request body
     tenant_id = user.get("tenant_id")
-    
-    # 2. Save file temporarily
     file_path = f"temp_{file.filename}"
+    
     try:
+        # 1. Save file temporarily
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
         
-        # 3. Parse intelligently
+        # 2. Parse intelligently
         full_text = extract_structured_text(file_path)
 
-        # 4. Save to Neon Database
+        # 3. GENERATE EMBEDDING (The "Modern" step)
+        # We turn the text into numbers before it hits the DB
+        vector_representation = get_embedding(full_text)
+
+        # 4. Save to Neon Database with the embedding column
         query = text("""
-            INSERT INTO document_knowledge (tenant_id, file_name, content)
-            VALUES (:tid, :fname, :cont)
+            INSERT INTO document_knowledge (tenant_id, file_name, content, embedding)
+            VALUES (:tid, :fname, :cont, :vec)
         """)
         
         with db._engine.connect() as conn:
             conn.execute(query, {
                 "tid": tenant_id,
                 "fname": file.filename,
-                "cont": full_text
+                "cont": full_text,
+                "vec": str(vector_representation) # pgvector accepts the list as a string
             })
-            conn.commit() # Important for non-autocommit engines
+            conn.commit()
 
         return {
             "status": "success", 
-            "message": f"Successfully learned from {file.filename} for tenant {tenant_id}"
+            "message": f"Successfully learned and indexed {file.filename}."
         }
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        print(f"Upload error: {e}")
+        return {"status": "error", "message": "Failed to process document."}
     
     finally:
-        # 5. Cleanup temp file regardless of success or failure
         if os.path.exists(file_path):
             os.remove(file_path)
 

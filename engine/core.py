@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from llama_index.llms.groq import Groq
 from langchain_community.utilities import SQLDatabase
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -28,3 +29,17 @@ def get_llm():
 # Initialize singletons to be reused across the app
 db = get_db()
 llm = get_llm()
+
+# This model is small, fast, and very good for retrieval (384 dimensions)
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def get_embedding(text: str):
+    """
+    Converts a string into a list of floats (vector).
+    """
+    if not text:
+        return None
+    # Clean text to remove newlines which can mess up embeddings
+    cleaned_text = text.replace("\n", " ")
+    embedding = embedding_model.encode(cleaned_text)
+    return embedding.tolist()

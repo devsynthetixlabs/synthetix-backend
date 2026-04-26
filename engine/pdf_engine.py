@@ -2,7 +2,7 @@ import pdfplumber
 import os
 from sqlalchemy import text
 from langchain_community.utilities import SQLDatabase
-from engine.core import db, llm
+from engine.core import db, llm, get_embedding
 
 def extract_structured_text(pdf_path):
     structured_text = ""
@@ -25,36 +25,39 @@ def extract_structured_text(pdf_path):
                 
     return structured_text
 
-def re_rank_context(question, documents):
-    if not documents:
-        return ""
-
-    # Prepare the list of docs for the LLM to rank
-    doc_list = "\n".join([f"ID {i}: {doc}" for i, doc in enumerate(documents)])
-
-    re_rank_prompt = f"""
-    You are a search ranker. Given the User Question and a list of Document Snippets, 
-    re-order the Snippets from most relevant to least relevant.
-    
-    User Question: {question}
-    Snippets:
-    {doc_list}
-    
-    Output ONLY the IDs of the top 2 snippets in order of relevance, separated by commas.
-    Example Output: 2, 0
+def re_rank_context(question, candidate_objects):
     """
-    
+    Updated to handle dictionaries containing metadata.
+    candidate_objects: List[dict] -> [{"content": "...", "file_name": "..."}]
+    """
     try:
-        # Use your Groq LLM to pick the best ones
-        response = llm.complete(re_rank_prompt).text.strip()
-        best_ids = [int(i.strip()) for i in response.split(",")]
+        if not candidate_objects:
+            return []
+
+        # 1. Extract only the text for the scoring model
+        # This prevents the "expected str instance, dict found" error
+        texts_to_score = [obj["content"] for obj in candidate_objects]
+
+        # 2. Perform your re-ranking logic (Cross-Encoder / LLM Scoring)
+        # Example using a simple cross-encoder:
+        # scores = cross_encoder.predict([(question, text) for text in texts_to_score])
         
-        # Reconstruct the context using only the top-ranked docs
-        reranked_context = "\n".join([documents[i] for i in best_ids if i < len(documents)])
-        return reranked_context
-    except:
-        # Fallback to original order if re-ranking fails
-        return "\n".join(documents[:2])
+        # 3. Filter/Sort the original objects based on scores
+        # For now, let's just ensure we return the objects themselves
+        # so the metadata (filenames) stays attached.
+        
+        # If you are using a simple filter:
+        relevant_objects = [
+            obj for obj in candidate_objects 
+            if len(obj["content"]) > 0 # Replace with your actual scoring logic
+        ]
+
+        return relevant_objects
+
+    except Exception as e:
+        print(f"❌ Re-ranker Error: {e}")
+        # Fallback: Return original objects so the system doesn't crash
+        return candidate_objects
 
 def get_relevant_pdf_context_with_rerank(question, tenant_id):
     # 1. Fetch MORE documents than before (e.g., LIMIT 5)
@@ -70,3 +73,58 @@ def get_relevant_pdf_context_with_rerank(question, tenant_id):
         
     # 2. Pass them through the Re-ranker
     return re_rank_context(question, docs)
+
+def get_hybrid_pdf_context(question, tenant_id):
+    try:
+        # 1. Embed the question
+        question_vector = get_embedding(question)
+        print(f"Vector generated. Size: {len(question_vector)}")
+
+        # 2. Execute SQL
+        query = text("""
+            WITH vector_matches AS (
+                SELECT id, content, file_name, created_at
+                FROM document_knowledge
+                WHERE tenant_id = :tid
+                ORDER BY embedding <=> :vector
+                LIMIT 5
+            ),
+            keyword_matches AS (
+                SELECT id, content, file_name, created_at
+                FROM document_knowledge
+                WHERE tenant_id = :tid 
+                AND content ILIKE :keyword
+                LIMIT 5
+            )
+            SELECT DISTINCT ON (id) content, file_name, created_at 
+            FROM (
+                SELECT * FROM vector_matches
+                UNION ALL
+                SELECT * FROM keyword_matches
+            ) combined_results;
+        """)
+
+        with db._engine.connect() as conn:
+            results = conn.execute(query, {
+                "tid": tenant_id,
+                "vector": str(question_vector),
+                "keyword": f"%{question}%"
+            }).fetchall()
+            
+        print(f"SQL Results Found: {len(results)}")
+
+        # 3. Format results
+        docs = [{"content": r[0], "file_name": r[1], "created_at": r[2]} for r in results]
+        
+        # 4. RE-RANK (Check if re_rank_context is working!)
+        if docs:
+            print("Passing docs to re-ranker...")
+            final_docs = re_rank_context(question, docs)
+            print(f"Final docs after re-rank: {len(final_docs)}")
+            return final_docs
+        
+        return []
+
+    except Exception as e:
+        print(f"❌ HYBRID ERROR: {str(e)}")
+        return []
