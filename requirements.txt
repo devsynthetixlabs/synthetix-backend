@@ -12,8 +12,9 @@ psycopg2-binary
 openpyxl
 sqlalchemy
 pdfplumber
-python-jose[cryptography]
-passlib[bcrypt]
 email-validator
 requests
 python-multipart
+passlib==1.7.4
+bcrypt==3.2.0
+python-jose[cryptography]
