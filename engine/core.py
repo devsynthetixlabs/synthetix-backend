@@ -1,9 +1,9 @@
 # engine/core.py
 import os
+import requests
 from dotenv import load_dotenv
 from llama_index.llms.groq import Groq
 from langchain_community.utilities import SQLDatabase
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -30,16 +30,12 @@ def get_llm():
 db = get_db()
 llm = get_llm()
 
-# This model is small, fast, and very good for retrieval (384 dimensions)
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+# Get a free API token from huggingface.co/settings/tokens
+HF_TOKEN = os.getenv("HF_TOKEN")
+API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
 
-def get_embedding(text: str):
-    """
-    Converts a string into a list of floats (vector).
-    """
-    if not text:
-        return None
-    # Clean text to remove newlines which can mess up embeddings
-    cleaned_text = text.replace("\n", " ")
-    embedding = embedding_model.encode(cleaned_text)
-    return embedding.tolist()
+def get_embedding(text):
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    response = requests.post(API_URL, headers=headers, json={"inputs": text})
+    # Returns the same 384-dim vector as your local model!
+    return response.json()
