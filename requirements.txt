@@ -14,3 +14,5 @@ sqlalchemy
 pdfplumber
 python-jose[cryptography]
 passlib[bcrypt]
+email-validator
+requests
