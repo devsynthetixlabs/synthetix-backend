@@ -1,4 +1,18 @@
 from sqlalchemy import inspect
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.types import UserDefinedType
+from sqlalchemy import event
+
+# 1. Define the Vector type for SQLAlchemy
+class PGVector(UserDefinedType):
+    def get_col_spec(self, **kw):
+        return "VECTOR"
+
+# 2. Register it so the inspector doesn't crash
+@event.listens_for(postgresql.base.PGDialect, "reflection_compiler_setup")
+def register_vector_type(dialect, compiler):
+    # This maps the 'vector' type in Postgres to our dummy PGVector class
+    dialect.ischema_names["vector"] = PGVector
 
 def get_db_schema(engine):
     inspector = inspect(engine)

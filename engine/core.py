@@ -1,6 +1,8 @@
 # engine/core.py
 import os
 import requests
+from google import genai
+from google.genai import types 
 from dotenv import load_dotenv
 from llama_index.llms.groq import Groq
 from langchain_community.utilities import SQLDatabase
@@ -35,21 +37,37 @@ def get_llm():
     )
 
 # --- EMBEDDING SETUP (Hugging Face API) ---
-HF_TOKEN = os.getenv("HF_TOKEN")
-API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+client = genai.Client(
+    api_key=os.getenv("GOOGLE_API_KEY"),
+    http_options={'api_version': 'v1beta'} # Changed from v1 to v1beta
+)
 
 def get_embedding(text):
-    if not HF_TOKEN:
-        print("Warning: HF_TOKEN is missing!")
-    
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    response = requests.post(API_URL, headers=headers, json={"inputs": text})
-    
-    # Error handling for the API call
-    if response.status_code != 200:
-        raise Exception(f"HF API Error: {response.text}")
+    if not text:
+        return None
         
-    return response.json()
+    clean_text = str(text).replace("\n", " ")
+    
+    try:
+        # gemini-embedding-2 is natively multimodal and handles PDFs/Text
+        result = client.models.embed_content(
+            model="gemini-embedding-2",
+            contents=clean_text,
+            config=types.EmbedContentConfig(
+                # Ensure this matches your 768-dim DB column
+                output_dimensionality=768,
+            )
+        )
+        
+        if result.embeddings:
+            return result.embeddings[0].values
+        return None
+        
+    except Exception as e:
+        print(f"Embedding Error: {e}")
+        # If gemini-embedding-2 is still finicky, 'text-embedding-004' 
+        # may still work ONLY if you switch back to 'v1'
+        raise Exception(f"Google API Error: {e}")
 
 # Initialize singletons
 db = get_db()

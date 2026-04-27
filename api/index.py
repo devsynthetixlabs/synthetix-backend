@@ -147,23 +147,26 @@ def ask_synthetix_labs_self_rag(question, tenant_id):
 
     # 4. GENERATE (With Citation & Conflict Logic)
     generation_prompt = f"""
-    You are the Synthetix Labs Corporate Assistant. Provide a professional and concise response based on the provided context.
+    You are the Synthetix Labs HR Assistant. Your goal is to provide clear, 
+    structured, and professional information based ONLY on the provided context.
 
     USER QUESTION: "{question}"
     CONTEXT: {formatted_context}
 
     STYLE GUIDELINES:
-    1. Start with a clear "Yes" or "No" in bold.
-    2. Use professional terminology (e.g., "designated as," "constitutes," "official holiday").
-    3. Ensure the logical connection between the date and the day of the week is explained smoothly, not as a list of math steps.
-    4. Always cite the specific source file in bold.
+    1. **Direct Answer**: Start with a summary sentence. Do NOT start with "Yes" or "No".
+    2. **Formatting**: Use bullet points for lists, dates, or multiple items to ensure the answer is scannable.
+    3. **Tone**: Professional yet accessible. Avoid overly dense legalese like "constitutes" unless necessary.
+    4. **Citations**: Mention the source file name in **bold** at the very end of the response.
+    5. **Constraint**: If the context doesn't contain the answer, state that you don't have that information on file.
 
     STRUCTURE:
-    - **Bold Answer Line**
-    - A brief paragraph explaining the reasoning and date verification.
-    - A final "Status" line if applicable.
-
-    ANSWER:
+    ## [Heading for the Topic]
+    - A 1-2 sentence high-level summary.
+    - **Key Details**: Use a bulleted list for specifics (dates, rules, or requirements).
+    - **Note**: Mention any specific conditions (like the Sunday-Monday holiday rule).
+    
+    Source: **[Source File Name]**
     """
     
     draft_answer= llm.complete(generation_prompt).text
@@ -223,11 +226,14 @@ async def upload_doc(file: UploadFile = File(...), user: dict = Depends(get_curr
         # 2. Parse intelligently
         full_text = extract_structured_text(file_path)
 
-        # 3. GENERATE EMBEDDING (The "Modern" step)
-        # We turn the text into numbers before it hits the DB
+        # 3. Generate 768-dim Gemini Embedding
+        # This now calls the google-genai logic we set up in core.py
         vector_representation = get_embedding(full_text)
 
-        # 4. Save to Neon Database with the embedding column
+        if not vector_representation:
+            raise ValueError("Failed to generate embedding from Gemini.")
+
+        # 4. Save to Neon with correct formatting
         query = text("""
             INSERT INTO document_knowledge (tenant_id, file_name, content, embedding)
             VALUES (:tid, :fname, :cont, :vec)
@@ -238,18 +244,20 @@ async def upload_doc(file: UploadFile = File(...), user: dict = Depends(get_curr
                 "tid": tenant_id,
                 "fname": file.filename,
                 "cont": full_text,
-                "vec": str(vector_representation) # pgvector accepts the list as a string
+                # pgvector expects a string representation of a list: "[0.1, 0.2, ...]"
+                "vec": str(vector_representation) 
             })
             conn.commit()
 
         return {
             "status": "success", 
-            "message": f"Successfully learned and indexed {file.filename}."
+            "message": f"Successfully indexed {file.filename} with Gemini 768-dim vectors."
         }
 
     except Exception as e:
         print(f"Upload error: {e}")
-        return {"status": "error", "message": "Failed to process document."}
+        # Detailed error for debugging during the migration
+        return {"status": "error", "message": f"Processing failed: {str(e)}"}
     
     finally:
         if os.path.exists(file_path):

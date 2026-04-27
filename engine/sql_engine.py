@@ -1,12 +1,7 @@
 import os
-import locale
 import re
-import ast
 from dotenv import load_dotenv
-from thefuzz import process
 from langchain_groq import ChatGroq
-from langchain_community.utilities import SQLDatabase
-from langchain_classic.chains import create_sql_query_chain
 from langchain_core.prompts import ChatPromptTemplate
 from sqlalchemy import text
 from decimal import Decimal
@@ -31,35 +26,13 @@ def format_inr(number):
     except Exception:
         return f"₹{number}"
 
-# TEST: format_inr(3305121) -> '₹33,05,121.00'
-
-def find_real_company_name(short_name):
-    query = text("SELECT DISTINCT company_name FROM invoices WHERE company_name ILIKE :name LIMIT 1")
-    try:
-        # Using the underlying engine for a clean result
-        with db._engine.connect() as connection:
-            result = connection.execute(query, {"name": f"%{short_name}%"}).fetchone()
-            if result:
-                return result[0] # Returns the string directly
-    except Exception as e:
-        print(f"Lookup error: {e}")
-    return short_name
-
-# TEST: find_real_company_name("PRALCKA") -> "PRALCKA MACHINERY MANUFACTURING PVT. LTD"
-
 load_dotenv()
 
-# 3. Initialize the Brain
 llm = ChatGroq(
     model_name="llama-3.1-8b-instant", 
     temperature=0,
-    model_kwargs={"response_format": {"type": "text"}} # Ensures it stays as text
+    model_kwargs={"response_format": {"type": "text"}}
 )
-
-# 4. Create the Question-to-SQL Chain
-chain = create_sql_query_chain(llm, db)
-
-current_schema = get_db_schema(db._engine)
 
 sql_writer_prompt = ChatPromptTemplate.from_template("""
     You are an expert PostgreSQL analyst for a sales database.
@@ -184,8 +157,11 @@ def validate_sql(query: str):
     if any(word in query_upper for word in forbidden):
         raise ValueError("Unsafe query detected")
 
-    # 🚨 Prevent multiple statements
-    if ";" in query.strip()[:-1]:
+    # Prevent multiple statements (check for semicolons outside string literals)
+    semicolon_count = query.count(";")
+    if semicolon_count > 1:
+        raise ValueError("Multiple SQL statements not allowed")
+    if semicolon_count == 1 and not query.strip().endswith(";"):
         raise ValueError("Multiple SQL statements not allowed")
 
     if not query_upper.startswith("SELECT"):
@@ -199,28 +175,13 @@ def enforce_limit(query: str):
 
     return query
 
-def normalize_result(result):
-    if isinstance(result, str):
-        result = eval(result)
-
-    # If single row
-    if isinstance(result, list) and len(result) == 1:
-        return result[0]   # ✅ return full row
-
-    return result
-
-def execute_query(query):
-    result = db.run(query)
-
-    if isinstance(result, str):
-        result = eval(result)
-
-    return result
-
 def ask_cfo(question, tenant_id):
     max_retries = 3
     error_log = ""
     last_sql = ""
+    
+    # Fetch fresh schema each time (High severity fix)
+    fresh_schema = get_db_schema(db._engine)
     
     for attempt in range(max_retries):
         try:
@@ -228,13 +189,30 @@ def ask_cfo(question, tenant_id):
             sql_writer_chain = sql_writer_prompt | llm
             raw_sql = sql_writer_chain.invoke({
                 "question": f"{question} {error_log}", 
-                "schema": current_schema,
+                "schema": fresh_schema,
                 "tenant_id": tenant_id,
             }).content
             
             sql_query = clean_sql(raw_sql)
             last_sql = sql_query # Store for debugging
             validate_sql(sql_query)
+
+            # CRITICAL FIX: Enforce tenant isolation at SQL level
+            # Inject tenant_id filter to prevent cross-tenant data leaks
+            if "WHERE" in sql_query.upper():
+                # Add tenant_id to existing WHERE clause
+                sql_query = re.sub(
+                    r"(WHERE\s+)",
+                    f"\\1tenant_id = '{tenant_id}' AND ",
+                    sql_query,
+                    flags=re.IGNORECASE
+                )
+            else:
+                # Add WHERE clause if none exists
+                sql_query = sql_query.rstrip(";") + f" WHERE tenant_id = '{tenant_id}'"
+
+            # Enforce limit
+            sql_query = enforce_limit(sql_query)
 
             # Step 2: Execute against Neon
             with db._engine.connect() as connection:
