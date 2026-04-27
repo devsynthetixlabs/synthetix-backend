@@ -11,4 +11,3 @@ pypdf
 psycopg2-binary
 openpyxl
 sqlalchemy
-crewai
