@@ -16,18 +16,15 @@ from engine.core import db, llm, get_embedding
 
 app = FastAPI()
 
-# --- CORS Configuration ---
-origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://192.168.31.231:8000",
-    "https://synthetix-web-app.vercel.app",
-    "https://synthetix-backend.vercel.app",
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://192.168.31.231:8000",
+        "https://synthetix-web-app.vercel.app",
+        "https://synthetix-backend.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
