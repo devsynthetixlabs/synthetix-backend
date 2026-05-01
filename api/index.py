@@ -48,11 +48,13 @@ def classify_query(question: str):
 
     1. PDF: Use this for internal company information, HR policies, 
        HOLIDAY lists, leave policies, office timings, or any document-based facts.
-       (Example: "When is Diwali?", "Is Friday a holiday?", "Sick leave policy")
+       (Example: "When is Diwali?", "Is Friday a holiday?", "sick leave policy")
 
     2. SQL: Use this for specific NUMERIC sales data, invoices, 
-       revenue, customer names, or item quantities from the database.
-       (Example: "Total sales in 2023", "Who is our top client?")
+       revenue, customer names, item quantities, most sold items,
+       product orders, top products, or item-level data from the database.
+       (Example: "Total sales in 2023", "What item was ordered the most?", 
+       "Top 5 products", "Which product sold most", "How many units")
 
     3. STRATEGY: Use ONLY if the user is asking for advice, a 3-step plan, 
        marketing suggestions, growth ideas, or business consulting.
@@ -64,7 +66,9 @@ def classify_query(question: str):
     """
 
     response = llm.complete(prompt)
-    return str(response.text).strip().upper()
+    result = str(response.text).strip().upper()
+    print(f"🔍 Classification result: {result}")
+    return result
 
 def is_followup(question: str):
     followup_words = ["it", "this", "that", "they", "those", "them"]
@@ -98,6 +102,7 @@ def ask_synthetix_labs(question: str, history: List[Message], tenant_id: str):
         print(f"📊 Routing to SQL Engine: {processed_question}")
         from engine.sql_engine import ask_cfo
         result = ask_cfo(processed_question, tenant_id)
+        print(f"📊 SQL Result: {result}")
         # Ensure we return only the string 'answer' from the dict
         return result['answer'] if isinstance(result, dict) else result
         

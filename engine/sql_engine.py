@@ -41,6 +41,8 @@ sql_writer_prompt = ChatPromptTemplate.from_template("""
     DATABASE_SCHEMA:
     {schema}
 
+    AVAILABLE YEARS IN DATABASE: {available_years}
+
     TENANT_CONTEXT:
     Current Tenant ID: {tenant_id}
 
@@ -62,8 +64,10 @@ sql_writer_prompt = ChatPromptTemplate.from_template("""
     - MATCHING: Never use = for company_name. ALWAYS use ILIKE '%name%'.
 
     USAGE RULES:
-    - Use 'invoices' for revenue, customer, or shipping queries.
-    - Use 'items' for quantity, product description, or rate queries.
+    - Use 'invoices' for revenue, customer, shipping, or invoice-level queries.
+    - Use 'items' for product/description, quantity, rate, or item-level queries.
+    - CRITICAL: The 'items' table contains individual ordered products.
+    - To find "most ordered item", use: description (or product_name) and SUM(quantity).
     - Use JOIN only when data from both tables is required.
 
     AGGREGATION & MATH:
@@ -82,13 +86,19 @@ sql_writer_prompt = ChatPromptTemplate.from_template("""
     Q: Which company sales dropped year-on-year?
     A: SELECT a.company_name, SUM(a.invoice_amount) as current, SUM(b.invoice_amount) as previous 
        FROM invoices a 
-       JOIN invoices b ON a.company_name = b.company_name 
-       WHERE a.year = '2023' AND b.year = '2022' 
+       JOIN invoices b ON a.company_name = b.company_name AND a.tenant_id = b.tenant_id
+       WHERE a.tenant_id = 'current_tenant' AND a.year = '2022' AND b.year = '2021' 
        GROUP BY a.company_name 
        HAVING SUM(a.invoice_amount) < SUM(b.invoice_amount)
 
     Q: Sales for company X in FY 2021-22
     A: SELECT SUM(invoice_amount) FROM invoices WHERE company_name ILIKE '%X%' AND date >= '2021-04-01' AND date <= '2022-03-31'
+
+    Q: What item was ordered the most?
+    A: SELECT description, SUM(quantity) as total_quantity FROM items GROUP BY description ORDER BY total_quantity DESC LIMIT 1
+
+    Q: Top 5 most sold items
+    A: SELECT description, SUM(quantity) as qty FROM items GROUP BY description ORDER BY qty DESC LIMIT 5
 
     User Question:
     {question}
@@ -126,6 +136,11 @@ narrator_prompt = ChatPromptTemplate.from_template("""
     - "The total revenue is ₹45,00,000."
     - "PACE PACKAGING MACHINES PVT LTD generated the highest revenue at ₹76,29,880."
     - "There are 1,358 invoices in total."
+
+    QUANTITY RULES:
+    - For quantity queries, just output the number with commas (e.g., "1,234 units").
+    - Do NOT add ₹ symbol for quantities.
+    - Keep it simple: "Item X sold 500 units."
 
     CRITICAL RULE:
     - If numeric value is NOT present in SQL result, say:
@@ -175,13 +190,67 @@ def enforce_limit(query: str):
 
     return query
 
+def _get_available_years(tenant_id):
+    """Fetch distinct years available in the database for this tenant."""
+    try:
+        with db._engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT DISTINCT year FROM invoices WHERE tenant_id = :tid ORDER BY year DESC"),
+                {"tid": tenant_id}
+            ).fetchall()
+            years = [str(r[0]).strip() for r in rows if r[0]]
+            return years
+    except Exception:
+        return []
+
+def _inject_tenant_filter(sql_query, tenant_id):
+    """Inject tenant_id filter on ALL table aliases in the query."""
+    if f"tenant_id = '{tenant_id}'" in sql_query:
+        return sql_query
+    
+    # Find all table aliases from FROM and JOIN clauses
+    aliases = set()
+    # Match: FROM table alias, JOIN table alias, FROM table, JOIN table
+    for match in re.finditer(r'\b(?:FROM|JOIN)\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?', sql_query, re.IGNORECASE):
+        table_name = match.group(1)
+        alias = match.group(2)
+        if alias and alias.upper() not in ('ON', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'LIMIT', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'SET', 'AND', 'OR', 'NOT', 'IN', 'EXISTS', 'SELECT', 'UNION', 'ALL', 'AS'):
+            aliases.add(alias)
+        else:
+            aliases.add(table_name)
+    
+    # Apply tenant filter to every alias
+    if "WHERE" in sql_query.upper():
+        parts = []
+        for alias in aliases:
+            parts.append(f"{alias}.tenant_id = '{tenant_id}'")
+        
+        tenant_filter = " AND ".join(parts)
+        sql_query = re.sub(
+            r"(WHERE\s+)",
+            f"\\1{tenant_filter} AND ",
+            sql_query,
+            flags=re.IGNORECASE,
+            count=1
+        )
+    else:
+        parts = []
+        for alias in aliases:
+            parts.append(f"{alias}.tenant_id = '{tenant_id}'")
+        tenant_filter = " AND ".join(parts)
+        sql_query = sql_query.rstrip(";") + f" WHERE {tenant_filter}"
+    
+    return sql_query
+
 def ask_cfo(question, tenant_id):
-    max_retries = 3
+    max_retries = 2
     error_log = ""
     last_sql = ""
+    last_error = ""
     
-    # Fetch fresh schema each time (High severity fix)
+    # Fetch fresh schema and available years each time
     fresh_schema = get_db_schema(db._engine)
+    available_years = _get_available_years(tenant_id)
     
     for attempt in range(max_retries):
         try:
@@ -191,25 +260,16 @@ def ask_cfo(question, tenant_id):
                 "question": f"{question} {error_log}", 
                 "schema": fresh_schema,
                 "tenant_id": tenant_id,
+                "available_years": ", ".join(available_years) if available_years else "Not available - use reasonable year guesses",
             }).content
             
             sql_query = clean_sql(raw_sql)
-            last_sql = sql_query # Store for debugging
+            last_sql = sql_query
             validate_sql(sql_query)
 
             # CRITICAL FIX: Enforce tenant isolation at SQL level
             # Inject tenant_id filter to prevent cross-tenant data leaks
-            if "WHERE" in sql_query.upper():
-                # Add tenant_id to existing WHERE clause
-                sql_query = re.sub(
-                    r"(WHERE\s+)",
-                    f"\\1tenant_id = '{tenant_id}' AND ",
-                    sql_query,
-                    flags=re.IGNORECASE
-                )
-            else:
-                # Add WHERE clause if none exists
-                sql_query = sql_query.rstrip(";") + f" WHERE tenant_id = '{tenant_id}'"
+            sql_query = _inject_tenant_filter(sql_query, tenant_id)
 
             # Enforce limit
             sql_query = enforce_limit(sql_query)
@@ -217,6 +277,9 @@ def ask_cfo(question, tenant_id):
             # Step 2: Execute against Neon
             with db._engine.connect() as connection:
                 db_data = connection.execute(text(sql_query)).fetchall()
+            
+            print(f"📊 SQL executed: {sql_query}")
+            print(f"📊 Result: {db_data}")
             
             # Step 3: SUCCESS - Process and return
             formatted_answer = process_and_narrate(db_data, question)
@@ -226,12 +289,14 @@ def ask_cfo(question, tenant_id):
             }
 
         except Exception as e:
-            # Step 4: FAILURE - Log error and loop back
-            error_log = f"\n(Previous Attempt Error: {str(e)})"
-            print(f"🔄 Retrying SQL (Attempt {attempt + 1}/3)...")
+            last_error = str(e)
+            error_msg = str(e)[:300]  # truncate long errors
+            error_log = f"\n[RETRY] Your previous SQL query failed with: {error_msg}. Generate a corrected query. Do NOT include tenant_id filters."
+            print(f"🔄 Retrying SQL (Attempt {attempt + 1}/{max_retries})...")
             
+    # All retries exhausted - return the actual error for debugging
     return {
-        "answer": "I attempted to query the data but ran into a structural issue I couldn't resolve.",
+        "answer": f"Could not answer this question. The query failed after {max_retries} attempts. Last error: {last_error}",
         "sql": last_sql
     }
 
@@ -242,13 +307,21 @@ def process_and_narrate(db_data, question):
     if not db_data:
         return "No data found for this period."
 
-    # 1. Format numbers using your format_inr logic
+    # 1. Format numbers: only currency columns get ₹, quantities get commas only
+    is_quantity_query = any(word in question.lower() for word in [
+        "sold", "quantity", "quantities", "units", "count", "number of",
+        "how many", "most sold", "top", "ordered", "purchased"
+    ])
+    
     processed_data = []
     for row in db_data:
         new_row = []
         for item in row:
             if isinstance(item, (int, float, Decimal)):
-                new_row.append(format_inr(item)) # Uses your existing ₹ logic
+                if is_quantity_query:
+                    new_row.append(f"{int(float(item)):,}")
+                else:
+                    new_row.append(format_inr(item))
             else:
                 new_row.append(str(item))
         processed_data.append(new_row)
