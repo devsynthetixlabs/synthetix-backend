@@ -1,83 +1,72 @@
-from crewai import Agent, Task, Crew, Process, LLM
-from crewai.tools import tool
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-strategy_llm = LLM(
-    model="groq/llama-3.1-8b-instant",
-    temperature=0.1,
-    api_key=os.getenv("GROQ_API_KEY"),
-    max_retries=2,
-    timeout=90
+llm = ChatGroq(
+    model_name="llama-3.1-8b-instant",
+    temperature=0.2,
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
-@tool("sales_data_tool")
-def sales_data_tool(question: str, tenant_id: str) -> str:
-    """Query the sales database for revenue, clients, orders, year-over-year comparisons. Returns formatted results with ₹ amounts."""
+def _fetch_sales_context(question: str, tenant_id: str) -> str:
+    """Run a quick SQL query to get relevant sales data for context."""
     from engine.sql_engine import ask_cfo
-    res = ask_cfo(question, tenant_id)
-    if isinstance(res, dict) and 'answer' in res:
-        return res['answer']
-    return str(res)
+    
+    context_questions = [
+        f"What are the top 5 clients by revenue for {tenant_id}?",
+        f"What is the total revenue and year-over-year trend?",
+    ]
+    
+    results = []
+    for q in context_questions:
+        try:
+            res = ask_cfo(q, tenant_id)
+            if isinstance(res, dict) and 'answer' in res:
+                results.append(res['answer'])
+        except Exception:
+            pass
+    
+    return " ".join(results) if results else "No specific sales data available."
 
-def ask_strategy(question: str, tenant_id: str):
+def ask_strategy(question: str, tenant_id: str) -> str:
     """
-    The main entry point for the Strategy Engine.
-    Called by api/index.py when a strategic query is detected.
+    Strategy engine: fetches sales data, then generates a strategy response.
+    Uses a single LLM call instead of CrewAI multi-agent to save dependencies.
     """
-    analyst = Agent(
-        role='Data Reporter',
-        goal='Get numbers from the database and report ONLY the raw data.',
-        backstory="You are a data reporter. Your ONLY job is to fetch and relay numbers. Never analyze or strategize.",
-        tools=[sales_data_tool],
-        llm=strategy_llm,
-        verbose=True,
-        allow_delegation=False,
-        max_iter=1,
-    )
+    try:
+        sales_context = _fetch_sales_context(question, tenant_id)
+    except Exception:
+        sales_context = "Sales data could not be retrieved."
 
-    strategist = Agent(
-        role='Business Consultant',
-        goal='Give concise, direct strategy advice based on the data.',
-        backstory="You are a business consultant. Answer directly using the analyst's data.",
-        llm=strategy_llm,
-        verbose=True,
-        allow_delegation=False,
-        max_iter=1,
-    )
+    prompt = ChatPromptTemplate.from_template("""
+        You are a senior business consultant analyzing sales data.
 
-    research_task = Task(
-        description=(
-            f"Query the database for: '{question}'\n"
-            f"Use tenant_id: '{tenant_id}'\n"
-            "Make ONE tool call. Then output ONLY the data as a numbered list of company names and ₹ amounts. "
-            "Do NOT give strategies or advice — that is someone else's job."
-        ),
-        expected_output="A short list of companies and ₹ amounts. No analysis.",
-        agent=analyst
-    )
+        SALES DATA CONTEXT:
+        {sales_context}
 
-    strategy_task = Task(
-        description=(
-            f"Based on the analyst's data above, answer: {question}\n"
-            "Reference specific numbers. Keep it to 3-4 sentences max."
-        ),        
-        expected_output="A short answer with data references.",
-        agent=strategist,
-        context=[research_task]
-    )
+        USER QUESTION:
+        {question}
 
-    crew = Crew(
-        agents=[analyst, strategist],
-        tasks=[research_task, strategy_task],
-        process=Process.sequential,
-        verbose=True
-    )
+        RULES:
+        - Base your answer on the sales data provided above
+        - If data is unavailable, say so directly
+        - Reference specific company names and ₹ amounts from the data
+        - Keep the answer to 3-5 sentences max
+        - Provide actionable, specific advice
+        - Do NOT invent numbers or companies
+
+        Answer:
+    """)
 
     try:
-        result = crew.kickoff()
-        return str(result)
+        chain = prompt | llm
+        response = chain.invoke({
+            "sales_context": sales_context,
+            "question": question,
+        })
+        return response.content
     except Exception as e:
-        return f"Strategy Engine Error: {str(e)}"
+        return f"Strategy analysis unavailable. Error: {str(e)}"

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.local
+.env*.local
+.vercel/
+.git/
+storage/
+data/
+*.xls
+*.xlsx
+*.pdf
+scripts/
+test_*.py
+debug_*.py
